@@ -1,9 +1,6 @@
-cat(
-    "
-    Importing libraries: data.table\n
-    "
-)
+cat("Importing libraries: data.table, igraph\n")
 library(data.table)
+library(igraph)
 
 #
 ###--- Loading ---###
@@ -92,7 +89,7 @@ load_binary_networks <- function(){
 
     binary_networks <- list()
 
-    for(dis in diseases[[1]]){
+    for(dis in diseases){
 
         tmp_df <- as.data.frame(fread( paste(path, dis, extension, sep='') ))
 
@@ -123,6 +120,21 @@ load_fisher_wrt_splits <- function(){
 
 }
 
+load_network_stats <- function(){
+
+    path <- "/home/PERSONALE/federico.magnani9/gepoh/main_results/"
+
+    network_stats <- fread(
+        paste(path, "network_stats.csv", sep=''), 
+        col.names=c('idx','diseases','N_diseases','vol','clusterIn','oneEdges','oneEdges_clusterIn','n_connected_nodes','n_connected_genes','n_connected_tfs'), 
+        colClasses=(c("numeric", "character", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric"))
+    )
+
+    return(network_stats)
+
+}
+
+
 load_data <- list(
     
     "diseases" = load_diseases,
@@ -132,9 +144,65 @@ load_data <- list(
     "triclusters" = load_triclusters,
     "signatures" = load_signatures,
     "splits" = load_splits,
-    "fisher_wrt_splits" = load_fisher_wrt_splits
+    "fisher_wrt_splits" = load_fisher_wrt_splits,
+    "network_stats" = load_network_stats
 
 )
+
+#
+###--- Utils ---###
+#
+
+get_signature <- function(num_code){
+    
+    signature <- paste(unlist(as.character(num_code)), collapse='')
+    return(signature)
+    
+}
+    
+digitsum <- function(str_code){
+ 
+    s <- sum(as.numeric(unlist(strsplit(str_code, split=''))))
+    return(s)
+
+}
+
+complement_code <- function(str_code){
+
+    num_code <- as.numeric(unlist(strsplit(str_code, split='')))
+    complement <- 1-num_code
+    str_code <- paste(as.character(complement), collapse='')
+    
+    return(str_code)
+
+}
+
+signature2split <- function(code){
+    
+    nOnes <- digitsum(code)
+    if(nOnes<7){    
+        code <- complement_code(code)
+    }
+
+    return(code)
+}
+
+diseases2code <- function(str_cluster){
+
+    diseases <- load_diseases()
+
+    code = ''
+    for(dis in diseases){
+        if(dis %in% unlist(strsplit(str_cluster, split=','))){
+            code = paste(code, '1', sep='')
+        }else{
+            code = paste(code, '0', sep='')
+        }
+    }    
+
+    return(code)
+
+}
 
 #
 ###--- Signatures and Splits ---###
@@ -173,70 +241,15 @@ load_disregnet_tensor <- function(){
 
 }
 
-get_signature <- function(num_code){
-    
-    signature <- paste(unlist(as.character(num_code)), collapse='')
-    return(signature)
-    
-}
-    
-digitsum <- function(str_code){
- 
-    s <- sum(as.numeric(unlist(strsplit(str_code, split=''))))
-    return(s)
-
-}
-
-complement_code <- function(str_code){
-
-    num_code <- as.numeric(unlist(strsplit(str_code, split='')))
-    complement <- 1-num_code
-    str_code <- paste(as.character(complement), collapse='')
-    
-    return(str_code)
-
-}
-
-signature2split <- function(code){
-    
-    nOnes <- digitsum(code)
-    if(nOnes<7){    
-        code <- complement_code(code)
-    }
-
-    return(code)
-}
-
 signatures_and_splits <- list(
 
-    "load_disregnet_tensor" = load_disregnet_tensor,
-    "get_signature" = get_signature,
-    "digitsum" = digitsum, 
-    "complement_code" = complement_code,
-    "signature2split" = signature2split
+    "load_disregnet_tensor" = load_disregnet_tensor
 
 )
 
 #
 ###--- Fisher test ---###
 #
-
-diseases2code <- function(str_cluster){
-
-    diseases <- load_diseases()
-
-    code = ''
-    for(dis in diseases){
-        if(dis %in% unlist(strsplit(str_cluster, split=','))){
-            code = paste(code, '1', sep='')
-        }else{
-            code = paste(code, '0', sep='')
-        }
-    }    
-
-    return(code)
-
-}
 
 perform_fisher_wrt_splits <- function(splits, triclusters){
 
@@ -331,15 +344,233 @@ perform_fisher_wrt_splits <- function(splits, triclusters){
 
 }
 
+aggregate_triclusters <- function(significative_triclusters, significative_fisher_test){
+
+    #--- Aggregate significative clusters with respect to diseases ---#
+
+    # The volume of the aggregating rows is summed
+    aggregate_df <- aggregate(significative_triclusters$vol, by=list(diseases=significative_triclusters$diseases), FUN=sum)
+    aggregate_df$vol <- aggregate_df$x
+    aggregate_df$x <- NULL
+
+    # Recover the number of diseases from the cluster name
+    N_diseases <- list()
+    for (i in 1:nrow(aggregate_df)){    
+        N_diseases <- c(N_diseases, length(strsplit(aggregate_df[i,]$diseases, ',')[[1]]))
+    }     
+    aggregate_df["N_diseases"] <- unlist(N_diseases)
+
+    clusterIn <- c()
+    for(cluster in aggregate_df$diseases){
+
+        ftest_filtered <- significative_fisher_test[significative_fisher_test$diseases==cluster, ]$clusterIn
+        clusterIn <- c(clusterIn, sum(ftest_filtered))
+
+    }
+    aggregate_df$clusterIn <- as.numeric(clusterIn)
+    aggregate_df <- aggregate_df[, c("diseases", "N_diseases", "vol", "clusterIn")]
+
+    return(aggregate_df)
+
+}
+
+compute_network_stats <- function(aggregate_df, significative_triclusters, binary_networks, splits){
+
+    n_oneEdges_col <- list()
+    n_oneEdges_clusterIn_col <- list()
+
+    tot_iterations <- nrow(aggregate_df)
+    iter <- 1
+
+    for(cluster in aggregate_df$diseases){
+
+        message(iter, "/", tot_iterations)
+        iter <- iter+1
+
+        #--- EDGES ---#
+        sample_dis <- strsplit(cluster, ',')[[1]][1]
+        sample_df <- binary_networks[[sample_dis]]
+        rownames(sample_df) <- tfs
+
+        # For identifying the clusterIn
+        cluster_code <- diseases2code(cluster)
+        if(digitsum(cluster_code)<7){
+            cluster_code <- complement_code(cluster_code)
+        }
+
+        n_clusterIn <- 0
+        n_oneEdges <- 0
+        n_oneEdges_clusterIn <- 0
+        for (i in 1:nrow(significative_triclusters[significative_triclusters$diseases==cluster,])){
+
+            row = significative_triclusters[significative_triclusters$diseases==cluster,][i,]
+
+            unique_tfs <- unlist(strsplit(row$tfs, ','))
+            unique_genes <- unlist(strsplit(row$genes, ','))
+            bipartite_adj <- sample_df[unique_tfs, unique_genes] 
+
+            filterSplit <- (splits[unique_tfs,unique_genes]==cluster_code)
+            n_clusterIn <- n_clusterIn + length( filterSplit[filterSplit] )
+
+            filterOnes <- (bipartite_adj[unique_tfs, unique_genes]==1)
+            n_oneEdges <- n_oneEdges + length( filterOnes[filterOnes] )
+
+            # Filter one-valued edges AND perfect splits
+            filterBoth <- filterSplit&filterOnes
+            n_oneEdges_clusterIn <- n_oneEdges_clusterIn + length(filterBoth[filterBoth])
+
+        }
+
+        n_oneEdges_col[cluster] <- n_oneEdges
+        n_oneEdges_clusterIn_col[cluster] <- n_oneEdges_clusterIn
+
+        # Safety check
+        stopifnot( n_clusterIn==aggregate_df[aggregate_df$diseases==cluster,]$clusterIn )
+
+    }
+
+    network_stats <- aggregate_df
+    network_stats$oneEdges <- n_oneEdges_col
+    network_stats$oneEdges_clusterIn <- n_oneEdges_clusterIn_col
+
+    return(network_stats)
+
+}
+
+compute_network_stats <- function(aggregate_df, significative_triclusters, binary_networks, splits){
+
+    n_oneEdges_col <- list()
+    n_oneEdges_perfectSplit_col <- list()
+    n_connected_nodes <- list()
+    n_connected_tfs <- list()
+    n_connected_genes <- list()
+
+    tot_iterations <- nrow(aggregate_df)
+    iter <- 1
+
+    for(cluster in aggregate_df$diseases){
+
+        message(iter, "/", tot_iterations)
+        iter <- iter+1
+
+        # The graph is undirected
+        g <- make_empty_graph(directed=F)
+
+        sample_dis <- strsplit(cluster, ',')[[1]][1]
+        sample_df <- binary_networks[[sample_dis]]
+        rownames(sample_df) <- tfs
+
+        # For identifying the perfect splits
+        cluster_code <- diseases2code(cluster)
+        if(digitsum(cluster_code)<7){
+            cluster_code <- complement_code(cluster_code)
+        }
+
+        n_perfectSplit <- 0
+        n_oneEdges <- 0
+        n_oneEdges_perfectSplit <- 0
+
+        #--- VERTICES ---#
+        unique_genes <- c()
+        unique_tfs <- c()
+
+        #--- EDGES ---#
+        edges <- c()
+
+        for (i in 1:nrow(significative_triclusters[significative_triclusters$diseases==cluster,])){
+
+            row = significative_triclusters[significative_triclusters$diseases==cluster,][i,]
+
+            row_tfs <- unlist(strsplit(row$tfs, ','))
+            row_genes <- unlist(strsplit(row$genes, ','))
+
+            unique_genes <- unique( c(unique_genes, row_genes) )
+            unique_tfs <- unique( c(unique_tfs, row_tfs) )
+
+            sub_splits <- splits[row_tfs, row_genes]
+            sub_adj <- sample_df[row_tfs, row_genes]
+
+            filterSplit <- (sub_splits==cluster_code)
+            n_perfectSplit <- n_perfectSplit + length( filterSplit[filterSplit] )
+
+            filterOnes <- (sub_adj==1)
+            n_oneEdges <- n_oneEdges + length( filterOnes[filterOnes] )
+
+            # Filter one-valued edges AND perfect splits
+            filterBoth <- filterSplit&filterOnes
+            n_oneEdges_perfectSplit <- n_oneEdges_perfectSplit + length(filterBoth[filterBoth])
+
+            filterBoth <- data.frame(filterBoth)
+            names(filterBoth) <- row_genes
+
+            sub_edges <- c()
+            # Edges of this sub-matrix
+            for(colname in row_genes){
+        
+                tmp_tfs <- row_tfs[ filterBoth[,colname] ] 
+
+                # Trick for making an array in which there are the tfs names alternating with always the same gene name
+                # This is because we want an edgelist, each couple an edge: gene,tfs, gene,tfs, gene,tfs, ...
+                tmp_edges <- rep(c(colname,1), time=length(tmp_tfs))
+                tmp_edges[tmp_edges==1] <- tmp_tfs
+    
+                sub_edges <- c(sub_edges, tmp_edges)
+
+            }
+
+            edges <- c(edges, sub_edges)
+
+        }
+
+        n_oneEdges_col[cluster] <- n_oneEdges
+        n_oneEdges_perfectSplit_col[cluster] <- n_oneEdges_perfectSplit
+        # Safety check
+        stopifnot( n_perfectSplit==aggregate_df[aggregate_df$diseases==cluster,]$clusterIn )
+
+        #--- ADD VERTICES ---#
+        # Red: tfs, Green: genes
+        g <- add_vertices(g, length(unique_tfs), color="red", type=TRUE)
+        g <- add_vertices(g, length(unique_genes), color="green", type=FALSE)
+        # Add name attribute to the vertices
+        V(g)[ V(g)$color=="red" ]$name <- unique_tfs
+        V(g)[ V(g)$color=="green" ]$name <- unique_genes
+
+        #--- ADD EDGES ---#
+        # Eventually add 0-edges and 1-edges with different colors
+        g <- add_edges(g, edges, color="black")
+
+        # Let's delete the un-connected nodes. They happen since we are considering only the 1-edges.
+        g <- delete.vertices(g, degree(g)==0)
+
+        n_connected_nodes[cluster] <- length(V(g))
+
+        connected_genes <- V(g)[V(g)$color=="red"]$name
+        n_connected_genes[cluster] <- length(connected_genes)
+
+        connected_tfs <- V(g)[V(g)$color=="green"]$name
+        n_connected_tfs[cluster] <- length(connected_tfs)
+
+    }
+
+    network_stats <- aggregate_df
+    network_stats$oneEdges <- as.numeric(n_oneEdges_col)
+    network_stats$oneEdges_clusterIn <- as.numeric(n_oneEdges_perfectSplit_col)
+    network_stats$n_connected_nodes <- as.numeric(n_connected_nodes)
+    network_stats$n_connected_genes <- as.numeric(n_connected_genes)
+    network_stats$n_connected_tfs <- as.numeric(n_connected_tfs)
+
+    return(network_stats)
+
+}
+
 fisher_wrt_splits <- list(
 
     "diseases2code" = diseases2code,
-    "perform_fisher" = perform_fisher_wrt_splits
+    "perform_fisher" = perform_fisher_wrt_splits,
+    "aggregate_triclusters" = aggregate_triclusters,
+    "network_stats"  = compute_network_stats
 
 )
-
-
-
 
 
 cat(
